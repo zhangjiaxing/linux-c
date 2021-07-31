@@ -45,9 +45,9 @@ int main(void){
     for(int i=0; i<if_count; i++){
         ifreq_p = &ifc.ifc_req[i];
 
-        struct in_addr *addr;
-        addr = &((struct sockaddr_in *) &ifreq_p->ifr_addr)->sin_addr;
-        inet_ntop(AF_INET, addr, ipaddr, INET_ADDRSTRLEN);
+        //struct in_addr *addr;
+        //addr = &((struct sockaddr_in *) &ifreq_p->ifr_addr)->sin_addr;
+        //inet_ntop(AF_INET, addr, ipaddr, INET_ADDRSTRLEN);
         SOCKADDR_TO_IPV4STR(&ifreq_p->ifr_addr, ipaddr, INET_ADDRSTRLEN);
         printf("%s %s\n", ifreq_p->ifr_name, ipaddr);
     }
