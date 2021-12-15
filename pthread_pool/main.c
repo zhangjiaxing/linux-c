@@ -19,9 +19,9 @@
 
 #define list_first_entry_or_null(ptr, type, field)  (list_empty(ptr) ? list_first_entry(ptr, type, field) : NULL)
 
-typedef void *(*worker_routine_fn_t)(void*);
+typedef void *(*task_routine_fn_t)(void*);
 typedef struct thread_node thread_node_t;
-typedef struct thread_worker thread_worker_t;
+typedef struct thread_task thread_task_t;
 typedef struct thread_pool thread_pool_t;
 
 
@@ -31,8 +31,8 @@ struct thread_node {
     struct list_head list;
 };
 
-struct thread_worker {
-    worker_routine_fn_t routine_fn;
+struct thread_task {
+    task_routine_fn_t routine_fn;
     void *arg;
     void *retval;
     struct list_head list;
@@ -43,8 +43,8 @@ struct thread_pool {
     uint32_t thread_count;
     uint32_t thread_active_count;
     struct thread_node threads;
-    struct thread_worker worker_ready;
-    struct thread_worker worker_finished;
+    struct thread_task task_ready;
+    struct thread_task task_finished;
     pthread_mutex_t lock;
     pthread_cond_t cond;
 };
@@ -58,8 +58,8 @@ thread_pool_t *thread_pool_new(uint32_t thread_max_num){
     memset(pool, 0, sizeof(*pool));
 
     INIT_LIST_HEAD(&(pool->threads.list));
-    INIT_LIST_HEAD(&(pool->worker_ready.list));
-    INIT_LIST_HEAD(&(pool->worker_finished.list));
+    INIT_LIST_HEAD(&(pool->task_ready.list));
+    INIT_LIST_HEAD(&(pool->task_finished.list));
 
     pool->thread_max_num = thread_max_num;
 
@@ -70,12 +70,12 @@ thread_pool_t *thread_pool_new(uint32_t thread_max_num){
 
 void thread_pool_destroy(thread_pool_t *pool){
     pthread_mutex_lock(&pool->lock);
-    struct thread_worker *cur, *tmp;
-    list_for_each_entry_safe(cur, tmp, &pool->worker_ready.list, list){
+    struct thread_task *cur, *tmp;
+    list_for_each_entry_safe(cur, tmp, &pool->task_ready.list, list){
         list_del_init(&cur->list);
         free(cur);
     }
-    list_for_each_entry_safe(cur, tmp, &pool->worker_finished.list, list){
+    list_for_each_entry_safe(cur, tmp, &pool->task_finished.list, list){
         list_del_init(&cur->list);
         free(cur);
     }
@@ -100,31 +100,31 @@ void *thread_routine(void *arg){
 
     for(;;){
         pthread_mutex_lock(&pool->lock);
-        while(list_empty(&pool->worker_ready.list)){
+        while(list_empty(&pool->task_ready.list)){
             pthread_cond_wait(&pool->cond, &pool->lock);
         }
 
-        thread_worker_t *worker = list_first_entry(&pool->worker_ready.list, thread_worker_t, list);
-        list_del_init(&worker->list);
+        thread_task_t *task = list_first_entry(&pool->task_ready.list, thread_task_t, list);
+        list_del_init(&task->list);
         pool->thread_active_count++;
         pthread_mutex_unlock(&pool->lock);
 
-        pthread_cleanup_push(free, worker); //TODO: 释放 worker->arg
+        pthread_cleanup_push(free, task); //TODO: 释放 task->arg
 
-        if(worker->routine_fn != NULL){
-            worker->retval = worker->routine_fn(worker->arg);
+        if(task->routine_fn != NULL){
+            task->retval = task->routine_fn(task->arg);
         }else{
-            worker->retval = NULL;
+            task->retval = NULL;
 
             pthread_t pthread_id = pthread_self();
-            DEBUG_LOG("tid: %u worker->routine is nullptr, arg is %p\n", (uint32_t)pthread_id, worker->arg);
+            DEBUG_LOG("tid: %u task->routine is nullptr, arg is %p\n", (uint32_t)pthread_id, task->arg);
         }
 
         pthread_cleanup_pop(0);
 
         pthread_mutex_lock(&pool->lock);
         pool->thread_active_count --;
-        list_add_tail(&worker->list, &pool->worker_finished.list);
+        list_add_tail(&task->list, &pool->task_finished.list);
         pthread_mutex_unlock(&pool->lock);
     }
     return NULL;
@@ -136,7 +136,7 @@ int thread_pool_auto_new_thread(thread_pool_t *pool){
 
     sched_yield(); // 等待thread获取任务
     pthread_mutex_lock(&pool->lock);
-    if(pool->thread_count >= pool->thread_max_num || list_empty(&pool->worker_ready.list)){
+    if(pool->thread_count >= pool->thread_max_num || list_empty(&pool->task_ready.list)){
         pthread_mutex_unlock(&pool->lock);
         return EINVAL;
     }
@@ -161,18 +161,18 @@ int thread_pool_auto_new_thread(thread_pool_t *pool){
     return ret;
 }
 
-int thread_pool_add_worker(thread_pool_t *pool, worker_routine_fn_t routine, void *arg){
-    struct thread_worker *worker = malloc(sizeof(*worker));
-    if(worker == NULL){
+int thread_pool_add_task(thread_pool_t *pool, task_routine_fn_t routine, void *arg){
+    struct thread_task *task = malloc(sizeof(*task));
+    if(task == NULL){
         return ENOMEM;
     }
-    memset(worker, 0, sizeof(*worker));
-    INIT_LIST_HEAD(&worker->list);
-    worker->routine_fn = routine;
-    worker->arg = arg;
+    memset(task, 0, sizeof(*task));
+    INIT_LIST_HEAD(&task->list);
+    task->routine_fn = routine;
+    task->arg = arg;
 
     pthread_mutex_lock(&pool->lock);
-    list_add_tail(&worker->list, &pool->worker_ready.list);
+    list_add_tail(&task->list, &pool->task_ready.list);
     pthread_cond_signal(&pool->cond);
     pthread_mutex_unlock(&pool->lock);
 
@@ -185,17 +185,17 @@ void thread_pool_wait(thread_pool_t *pool){
     bool finished_flag = false;
     while(! finished_flag){
         pthread_mutex_lock(&pool->lock);
-        finished_flag = list_empty(&pool->worker_ready.list) && pool->thread_active_count == 0;
+        finished_flag = list_empty(&pool->task_ready.list) && pool->thread_active_count == 0;
         pthread_mutex_unlock(&pool->lock);
     }
 }
 
-int thread_pool_release_finished_worker(thread_pool_t *pool, worker_routine_fn_t *fn, void **retval, void **arg){
+int thread_pool_release_finished_task(thread_pool_t *pool, task_routine_fn_t *fn, void **retval, void **arg){
 
     pthread_mutex_lock(&pool->lock);
 
-    if( ! list_empty(&pool->worker_finished.list)){
-        struct thread_worker *first = list_first_entry(&pool->worker_finished.list, struct thread_worker, list);
+    if( ! list_empty(&pool->task_finished.list)){
+        struct thread_task *first = list_first_entry(&pool->task_finished.list, struct thread_task, list);
         list_del_init(&first->list);
         pthread_mutex_unlock(&pool->lock);
 
@@ -217,7 +217,7 @@ int thread_pool_release_finished_worker(thread_pool_t *pool, worker_routine_fn_t
 }
 
 
-void *echo_worker(void *userdata){
+void *echo_task(void *userdata){
     char *str = userdata;
     pthread_t tid = pthread_self();
     printf("%s: tid: %u echo: %s\n", __func__, (unsigned int)tid, str);
@@ -231,18 +231,18 @@ int main()
 {
     thread_pool_t *pool = thread_pool_new(2);
 
-    thread_pool_add_worker(pool, echo_worker, strdup("bash"));
-    thread_pool_add_worker(pool, echo_worker, strdup("mount"));
-    thread_pool_add_worker(pool, echo_worker, strdup("cat"));
-    thread_pool_add_worker(pool, echo_worker, strdup("pwd"));
-    thread_pool_add_worker(pool, echo_worker, strdup("find"));
-    thread_pool_add_worker(pool, echo_worker, strdup("vscode"));
-    thread_pool_add_worker(pool, echo_worker, strdup("firefox"));
+    thread_pool_add_task(pool, echo_task, strdup("bash"));
+    thread_pool_add_task(pool, echo_task, strdup("mount"));
+    thread_pool_add_task(pool, echo_task, strdup("cat"));
+    thread_pool_add_task(pool, echo_task, strdup("pwd"));
+    thread_pool_add_task(pool, echo_task, strdup("find"));
+    thread_pool_add_task(pool, echo_task, strdup("vscode"));
+    thread_pool_add_task(pool, echo_task, strdup("firefox"));
 
     thread_pool_wait(pool);
 
     void *arg;
-    while(thread_pool_release_finished_worker(pool, NULL, NULL, &arg) == 0){
+    while(thread_pool_release_finished_task(pool, NULL, NULL, &arg) == 0){
         printf("free( %s )\n", (char *)arg);
         free(arg);
     }
