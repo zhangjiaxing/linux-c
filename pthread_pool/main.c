@@ -151,6 +151,7 @@ int thread_pool_auto_new_thread(thread_pool_t *pool){
         memset(thread, 0, sizeof(*thread));
         INIT_LIST_HEAD(&thread->list);
         thread->thread_arg = pool;
+        thread->thread = thread_id;
 
         pthread_mutex_lock(&pool->lock);
         list_add(&thread->list, &pool->threads.list);
