@@ -39,14 +39,19 @@ struct thread_task {
 };
 
 struct thread_pool {
-    uint32_t thread_max_num;
-    uint32_t thread_count;
-    uint32_t thread_active_count;
+    uint32_t thread_max_num;  //允许的最大线程数量
+    uint32_t thread_count;  //当前活动的线程数量 （没有被 cancel 或者 pthread_exit 的进程数量）
+    uint32_t thread_active_count; // 当前正在运行用户任务的线程数量
+    uint32_t thread_cancel_count;  // cancel 或者 exit的线程数量
     struct thread_node threads;
     struct thread_task task_ready;
-    struct thread_task task_finished;
+    struct thread_task task_finish;
+    struct thread_task task_cancel;
+
     pthread_mutex_t lock;
     pthread_cond_t cond;
+
+    bool running_flag;
 };
 
 
@@ -59,9 +64,11 @@ thread_pool_t *thread_pool_new(uint32_t thread_max_num){
 
     INIT_LIST_HEAD(&(pool->threads.list));
     INIT_LIST_HEAD(&(pool->task_ready.list));
-    INIT_LIST_HEAD(&(pool->task_finished.list));
+    INIT_LIST_HEAD(&(pool->task_finish.list));
+    INIT_LIST_HEAD(&(pool->task_cancel.list));
 
     pool->thread_max_num = thread_max_num;
+    pool->running_flag = 1;
 
     pthread_mutex_init(&pool->lock, NULL);
     pthread_cond_init(&pool->cond, NULL);
@@ -75,17 +82,31 @@ void thread_pool_destroy(thread_pool_t *pool){
         list_del_init(&cur->list);
         free(cur);
     }
-    list_for_each_entry_safe(cur, tmp, &pool->task_finished.list, list){
+    list_for_each_entry_safe(cur, tmp, &pool->task_finish.list, list){
         list_del_init(&cur->list);
         free(cur);
     }
+    list_for_each_entry_safe(cur, tmp, &pool->task_cancel.list, list){
+        list_del_init(&cur->list);
+        free(cur);
+    }
+
+    pool->running_flag = false;
+
     struct thread_node *cur_thread_node, *tmp_thread_node;
     list_for_each_entry_safe(cur_thread_node, tmp_thread_node, &pool->threads.list, list){
         pthread_t thread = cur_thread_node->thread;
+
+        pthread_mutex_unlock(&pool->lock);
+
+        pthread_cancel(thread);
         if(pthread_kill(thread, 0) == 0){
-            pthread_cancel(thread);
-            pthread_join(thread, NULL);
+            pthread_cond_broadcast(&pool->cond);
         }
+        pthread_join(thread, NULL);
+
+        pthread_mutex_lock(&pool->lock);
+
         list_del_init(&cur_thread_node->list);
         free(cur_thread_node);
     }
@@ -95,38 +116,86 @@ void thread_pool_destroy(thread_pool_t *pool){
     free(pool);
 }
 
+struct pthread_cleanup_data{
+    thread_pool_t *pool;
+    thread_task_t *task;
+};
+
+
+thread_task_t *_thread_routine_get_readytask_cond(thread_pool_t *pool){
+    pthread_mutex_lock(&pool->lock);
+
+    while(pool->running_flag && list_empty(&pool->task_ready.list)){
+        pthread_cond_wait(&pool->cond, &pool->lock);
+    }
+    if(! pool->running_flag){
+        pthread_mutex_unlock(&pool->lock);
+        DEBUG_LOG("normal pthread_exit: %u\n", (unsigned int) pthread_self());
+        pthread_exit(NULL);
+    }
+
+    thread_task_t *task = list_first_entry(&pool->task_ready.list, thread_task_t, list);
+    list_del_init(&task->list);
+    pool->thread_active_count++;
+
+    pthread_mutex_unlock(&pool->lock);
+    return task;
+}
+
+void _thread_routine_put_finishtask(thread_pool_t *pool, thread_task_t *task){
+    pthread_mutex_lock(&pool->lock);
+    pool->thread_active_count --;
+    list_add_tail(&task->list, &pool->task_finish.list);
+    pthread_mutex_unlock(&pool->lock);
+}
+
+void _thread_routine_put_canceltask(void *cleanup_data){
+    struct pthread_cleanup_data *data = cleanup_data;
+    thread_pool_t *pool = data->pool;
+    thread_task_t *task = data->task;
+
+    pthread_mutex_lock(&pool->lock);
+    pool->thread_active_count --;
+    pool->thread_count --;
+    pool->thread_cancel_count ++;
+    list_add_tail(&task->list, &pool->task_cancel.list);
+    pthread_mutex_unlock(&pool->lock);
+
+    DEBUG_LOG("pthread_cancel: %u\n", (unsigned int) pthread_self());
+}
+
+
 void *thread_routine(void *arg){
     thread_pool_t *pool = arg;
 
-    for(;;){
-        pthread_mutex_lock(&pool->lock);
-        while(list_empty(&pool->task_ready.list)){
-            pthread_cond_wait(&pool->cond, &pool->lock);
-        }
+    int old_cancel_state;
 
-        thread_task_t *task = list_first_entry(&pool->task_ready.list, thread_task_t, list);
-        list_del_init(&task->list);
-        pool->thread_active_count++;
-        pthread_mutex_unlock(&pool->lock);
+    while(pool->running_flag){
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state); //cond_wait时禁止cancel， 防止锁资源释放错误
+        thread_task_t *task = _thread_routine_get_readytask_cond(pool);
+        pthread_setcancelstate(old_cancel_state, NULL); // 支持在运行用户task时，支持cancel
 
-        pthread_cleanup_push(free, task); //TODO: 释放 task->arg
+        struct pthread_cleanup_data cleanup_data = {
+            .pool = pool,
+            .task = task
+        };
+        int old_cancel_type;
+        pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &old_cancel_type); // see pthread_cleanup_push_defer_np
+        pthread_cleanup_push(_thread_routine_put_canceltask, &cleanup_data);
 
         if(task->routine_fn != NULL){
             task->retval = task->routine_fn(task->arg);
         }else{
             task->retval = NULL;
-
-            pthread_t pthread_id = pthread_self();
-            DEBUG_LOG("tid: %u task->routine is nullptr, arg is %p\n", (uint32_t)pthread_id, task->arg);
+            DEBUG_LOG("tid: %u task->routine is nullptr, arg is %p\n", (uint32_t)pthread_self(), task->arg);
         }
 
         pthread_cleanup_pop(0);
+        pthread_setcanceltype(old_cancel_type, NULL);
 
-        pthread_mutex_lock(&pool->lock);
-        pool->thread_active_count --;
-        list_add_tail(&task->list, &pool->task_finished.list);
-        pthread_mutex_unlock(&pool->lock);
+        _thread_routine_put_finishtask(pool, task);
     }
+
     return NULL;
 }
 
@@ -162,6 +231,15 @@ int thread_pool_auto_new_thread(thread_pool_t *pool){
     return ret;
 }
 
+int thread_pool_release_canceledthread(thread_pool_t *pool){
+    pthread_mutex_lock(&pool->lock);
+
+    // TODO:
+
+    pthread_mutex_unlock(&pool->lock);
+    return 0;
+}
+
 int thread_pool_add_task(thread_pool_t *pool, task_routine_fn_t routine, void *arg){
     struct thread_task *task = malloc(sizeof(*task));
     if(task == NULL){
@@ -192,11 +270,35 @@ void thread_pool_wait(thread_pool_t *pool){
 }
 
 int thread_pool_release_finished_task(thread_pool_t *pool, task_routine_fn_t *fn, void **retval, void **arg){
-
     pthread_mutex_lock(&pool->lock);
 
-    if( ! list_empty(&pool->task_finished.list)){
-        struct thread_task *first = list_first_entry(&pool->task_finished.list, struct thread_task, list);
+    if( ! list_empty(&pool->task_finish.list)){
+        struct thread_task *first = list_first_entry(&pool->task_finish.list, struct thread_task, list);
+        list_del_init(&first->list);
+        pthread_mutex_unlock(&pool->lock);
+
+        if(fn != NULL){
+            *fn = first->routine_fn;
+        }
+        if(retval != NULL){
+            *retval = first->retval;
+        }
+        if(arg != NULL){
+            *arg = first->arg;
+        }
+        free(first);
+        return 0;
+    }else{
+        pthread_mutex_unlock(&pool->lock);
+        return ENOENT;
+    }
+}
+
+int thread_pool_release_canceled_task(thread_pool_t *pool, task_routine_fn_t *fn, void **retval, void **arg){
+    pthread_mutex_lock(&pool->lock);
+
+    if( ! list_empty(&pool->task_cancel.list)){
+        struct thread_task *first = list_first_entry(&pool->task_cancel.list, struct thread_task, list);
         list_del_init(&first->list);
         pthread_mutex_unlock(&pool->lock);
 
@@ -222,29 +324,44 @@ void *echo_task(void *userdata){
     char *str = userdata;
     pthread_t tid = pthread_self();
     printf("%s: tid: %u echo: %s\n", __func__, (unsigned int)tid, str);
-    sleep(1);
+    sleep(5);
 
+    tid = tid / 100;
+    if(tid % 2 == 1){
+        pthread_exit(NULL);
+    }
     return str;
 }
 
 
 int main()
 {
-    thread_pool_t *pool = thread_pool_new(2);
+    thread_pool_t *pool = thread_pool_new(5);
 
     thread_pool_add_task(pool, echo_task, strdup("bash"));
     thread_pool_add_task(pool, echo_task, strdup("mount"));
     thread_pool_add_task(pool, echo_task, strdup("cat"));
     thread_pool_add_task(pool, echo_task, strdup("pwd"));
     thread_pool_add_task(pool, echo_task, strdup("find"));
+
     thread_pool_add_task(pool, echo_task, strdup("vscode"));
     thread_pool_add_task(pool, echo_task, strdup("firefox"));
+    thread_pool_add_task(pool, echo_task, strdup("qt-creator"));
+    thread_pool_add_task(pool, echo_task, strdup("anjuta"));
+    thread_pool_add_task(pool, echo_task, strdup("gedit"));
+
+    thread_pool_add_task(pool, echo_task, strdup("libreoffice"));
 
     thread_pool_wait(pool);
 
     void *arg;
     while(thread_pool_release_finished_task(pool, NULL, NULL, &arg) == 0){
-        printf("free( %s )\n", (char *)arg);
+        printf("free finished_task ( %s )\n", (char *)arg);
+        free(arg);
+    }
+
+    while(thread_pool_release_canceled_task(pool, NULL, NULL, &arg) == 0){
+        printf("free canceled_task ( %s )\n", (char *)arg);
         free(arg);
     }
 
