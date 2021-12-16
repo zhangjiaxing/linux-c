@@ -17,6 +17,7 @@
 #define DEBUG_LOG(fmt, ...)
 #endif
 
+
 #define list_first_entry_or_null(ptr, type, field)  (list_empty(ptr) ? list_first_entry(ptr, type, field) : NULL)
 
 typedef void *(*task_routine_fn_t)(void*);
@@ -39,7 +40,7 @@ struct thread_task {
 };
 
 struct thread_pool {
-    uint32_t thread_max_num;  //允许的最大线程数量
+    uint32_t thread_max_num;  //允许的最大线程数量, 0代表不限制
     uint32_t thread_count;  //当前活动的线程数量 （没有被 cancel 或者 pthread_exit 的进程数量）
     uint32_t thread_active_count; // 当前正在运行用户任务的线程数量
     uint32_t thread_cancel_count;  // cancel 或者 exit的线程数量
@@ -161,7 +162,7 @@ void _thread_routine_put_canceltask(void *cleanup_data){
     list_add_tail(&task->list, &pool->task_cancel.list);
     pthread_mutex_unlock(&pool->lock);
 
-    DEBUG_LOG("pthread_cancel: %u\n", (unsigned int) pthread_self());
+//    DEBUG_LOG("pthread_cancel: %u\n", (unsigned int) pthread_self());
 }
 
 
@@ -203,9 +204,15 @@ int thread_pool_auto_new_thread(thread_pool_t *pool){
     pthread_t thread_id;
     int ret;
 
+    pthread_cond_signal(&pool->cond);
     sched_yield(); // 等待thread获取任务
     pthread_mutex_lock(&pool->lock);
-    if(pool->thread_count >= pool->thread_max_num || list_empty(&pool->task_ready.list)){
+
+    int32_t idle_count = pool->thread_max_num == 0 ? 0 : pool->thread_count - pool->thread_active_count;
+    bool thread_full = pool->thread_max_num == 0 ? false : pool->thread_count >= pool->thread_max_num;
+    bool task_empty = list_empty(&pool->task_ready.list);
+
+    if(task_empty || thread_full || idle_count > 8){
         pthread_mutex_unlock(&pool->lock);
         return EINVAL;
     }
@@ -225,8 +232,8 @@ int thread_pool_auto_new_thread(thread_pool_t *pool){
         pthread_mutex_lock(&pool->lock);
         list_add(&thread->list, &pool->threads.list);
         pool->thread_count++;
+        DEBUG_LOG(">>>>>> new thread %u \n", (unsigned int)thread_id);
         pthread_mutex_unlock(&pool->lock);
-
     }
     return ret;
 }
@@ -234,9 +241,31 @@ int thread_pool_auto_new_thread(thread_pool_t *pool){
 int thread_pool_release_canceledthread(thread_pool_t *pool){
     pthread_mutex_lock(&pool->lock);
 
-    // TODO:
+    if(pool->thread_cancel_count == 0){
+        pthread_mutex_unlock(&pool->lock);
+        return ENOENT;
+    }
+
+    uint32_t join_count = 0;
+    struct thread_node *cur, *tmp;
+    list_for_each_entry_safe(cur, tmp, &pool->threads.list, list){
+        pthread_t thread_id = cur->thread;
+        if(pthread_kill(thread_id, 0) == ESRCH){
+            pthread_join(thread_id, NULL);
+            pool->thread_cancel_count --;
+            join_count++;
+            list_del_init(&cur->list);
+            free(cur);
+            DEBUG_LOG("========== release %u \n", (unsigned int)thread_id);
+        }
+    }
 
     pthread_mutex_unlock(&pool->lock);
+
+    while(join_count-- > 0){
+        thread_pool_auto_new_thread(pool);
+    }
+
     return 0;
 }
 
@@ -252,10 +281,10 @@ int thread_pool_add_task(thread_pool_t *pool, task_routine_fn_t routine, void *a
 
     pthread_mutex_lock(&pool->lock);
     list_add_tail(&task->list, &pool->task_ready.list);
-    pthread_cond_signal(&pool->cond);
     pthread_mutex_unlock(&pool->lock);
 
     thread_pool_auto_new_thread(pool);
+    pthread_cond_signal(&pool->cond);
 
     return 0;
 }
@@ -263,9 +292,12 @@ int thread_pool_add_task(thread_pool_t *pool, task_routine_fn_t routine, void *a
 void thread_pool_wait(thread_pool_t *pool){
     bool finished_flag = false;
     while(! finished_flag){
+        sched_yield();
+//        sleep(1);
         pthread_mutex_lock(&pool->lock);
         finished_flag = list_empty(&pool->task_ready.list) && pool->thread_active_count == 0;
         pthread_mutex_unlock(&pool->lock);
+        thread_pool_release_canceledthread(pool); //防止所有进程被exit && task 不为空 导致的死循环
     }
 }
 
@@ -324,35 +356,52 @@ void *echo_task(void *userdata){
     char *str = userdata;
     pthread_t tid = pthread_self();
     printf("%s: tid: %u echo: %s\n", __func__, (unsigned int)tid, str);
-    sleep(5);
 
-    tid = tid / 100;
-    if(tid % 2 == 1){
+    sleep(1);
+
+    long i = random();
+    if(i % 3 == 0){
         pthread_exit(NULL);
     }
     return str;
 }
 
-
 int main()
 {
-    thread_pool_t *pool = thread_pool_new(5);
+    thread_pool_t *pool = thread_pool_new(4);
 
-    thread_pool_add_task(pool, echo_task, strdup("bash"));
-    thread_pool_add_task(pool, echo_task, strdup("mount"));
-    thread_pool_add_task(pool, echo_task, strdup("cat"));
-    thread_pool_add_task(pool, echo_task, strdup("pwd"));
-    thread_pool_add_task(pool, echo_task, strdup("find"));
+    int i = 1000;
+    while(i-- > 0){
+        thread_pool_add_task(pool, echo_task, strdup("openbox"));
+        thread_pool_add_task(pool, echo_task, strdup("cinnamon"));
+        thread_pool_add_task(pool, echo_task, strdup("lxqt"));
+        thread_pool_add_task(pool, echo_task, strdup("xfce"));
 
-    thread_pool_add_task(pool, echo_task, strdup("vscode"));
-    thread_pool_add_task(pool, echo_task, strdup("firefox"));
-    thread_pool_add_task(pool, echo_task, strdup("qt-creator"));
-    thread_pool_add_task(pool, echo_task, strdup("anjuta"));
-    thread_pool_add_task(pool, echo_task, strdup("gedit"));
+        thread_pool_wait(pool);
+        thread_pool_release_canceledthread(pool);
+        fprintf(stderr, "\n\n");
 
-    thread_pool_add_task(pool, echo_task, strdup("libreoffice"));
 
-    thread_pool_wait(pool);
+        thread_pool_add_task(pool, echo_task, strdup("KDE"));
+        thread_pool_add_task(pool, echo_task, strdup("vscode"));
+        thread_pool_add_task(pool, echo_task, strdup("firefox"));
+        thread_pool_add_task(pool, echo_task, strdup("qt-creator"));
+
+        thread_pool_wait(pool);
+        thread_pool_release_canceledthread(pool);
+        fprintf(stderr, "\n\n");
+
+        thread_pool_add_task(pool, echo_task, strdup("anjuta"));
+        thread_pool_add_task(pool, echo_task, strdup("gedit"));
+        thread_pool_add_task(pool, echo_task, strdup("libreoffice"));
+        thread_pool_add_task(pool, echo_task, strdup("chrome"));
+
+        thread_pool_add_task(pool, echo_task, strdup("Gnome"));
+
+        thread_pool_wait(pool);
+        thread_pool_release_canceledthread(pool);
+        fprintf(stderr, "\n\n");
+    }
 
     void *arg;
     while(thread_pool_release_finished_task(pool, NULL, NULL, &arg) == 0){
