@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
 #include <linux/memfd.h>
@@ -20,6 +21,7 @@
 struct memtext {
     sem_t sem_write;
     sem_t sem_read;
+    bool running;
     char text[1];
 };
 
@@ -42,6 +44,7 @@ int main(void){
     }
 
     struct memtext *mtext = addr;
+    mtext->running = true;
     sem_init(&mtext->sem_write, 1, 0);
     sem_init(&mtext->sem_read, 1, 1);
 
@@ -65,23 +68,32 @@ int main(void){
         sem_post(&mtext->sem_write);
 
         sem_wait(&mtext->sem_read); // 等待读结束 //sleep(1)
+        mtext->running = false;
+        sem_post(&mtext->sem_write); // 通知child process退出
+
         sem_destroy(&mtext->sem_read);
         sem_destroy(&mtext->sem_write);
-        fprintf(stderr, "parent exit!");
+        fprintf(stderr, "parent exit!\n");
+
+        munmap(addr, FILESIZE);
+        close(fd);
         exit(0);
         
     }else if(pid == 0){
         //child
 
-        while(1){
-            
+        while(true){
             int res = sem_wait(&mtext->sem_write);
-            if(res == EINVAL){
-                fprintf(stderr, "child exit!");
-                exit(0);
-            }
             if(res == EAGAIN || res == EINTR){
                 continue;
+            }
+            if(mtext->running == false){
+                fprintf(stderr, "child exit!\n");
+                sem_destroy(&mtext->sem_read);
+                sem_destroy(&mtext->sem_write);
+                munmap(addr, FILESIZE);
+                close(fd);
+                _exit(0);
             }
 
             char *cur = mtext->text;
