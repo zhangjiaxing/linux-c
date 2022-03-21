@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
 #include <linux/memfd.h>
 #include <sys/mman.h>
 #include <semaphore.h>
@@ -63,15 +64,26 @@ int main(void){
         sprintf(mtext->text, "go\n");
         sem_post(&mtext->sem_write);
 
-        sleep(1);
+        sem_wait(&mtext->sem_read); // 等待读结束 //sleep(1)
         sem_destroy(&mtext->sem_read);
         sem_destroy(&mtext->sem_write);
+        fprintf(stderr, "parent exit!");
         exit(0);
         
     }else if(pid == 0){
         //child
+
         while(1){
-            sem_wait(&mtext->sem_write);
+            
+            int res = sem_wait(&mtext->sem_write);
+            if(res == EINVAL){
+                fprintf(stderr, "child exit!");
+                exit(0);
+            }
+            if(res == EAGAIN || res == EINTR){
+                continue;
+            }
+
             char *cur = mtext->text;
             printf("> ");
             while(*cur != '\0'){
