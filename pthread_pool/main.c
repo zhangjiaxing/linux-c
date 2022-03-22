@@ -9,7 +9,7 @@
 #include <pthread.h>
 #include <sched.h>
 
-#include "list.h"
+#include "../list.h"
 
 #ifndef NDEBUG
 #define DEBUG_LOG(fmt, ...) do { fprintf(stderr, "%s: " fmt, __func__, ## __VA_ARGS__); } while (0)

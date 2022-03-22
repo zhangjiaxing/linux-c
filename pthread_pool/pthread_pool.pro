@@ -4,7 +4,7 @@ CONFIG -= app_bundle
 CONFIG -= qt
 
 HEADERS += \
-        list.h
+        ../list.h
 
 SOURCES += \
         main.c
